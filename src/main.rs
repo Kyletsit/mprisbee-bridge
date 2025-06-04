@@ -5,10 +5,7 @@ use async_std::sync::RwLock;
 use async_std::task;
 use futures::{FutureExt, StreamExt, select};
 use mpris_server::{
-    LoopStatus, Metadata, PlaybackRate, PlaybackStatus, PlayerInterface, Playlist, PlaylistId,
-    PlaylistOrdering, PlaylistsInterface, Property, RootInterface, Server, Signal, Time, TrackId,
-    TrackListInterface, Uri, Volume,
-    zbus::{Result, fdo},
+    builder::MetadataBuilder, zbus::{fdo, Result}, LoopStatus, Metadata, PlaybackRate, PlaybackStatus, PlayerInterface, Playlist, PlaylistId, PlaylistOrdering, PlaylistsInterface, Property, RootInterface, Server, Signal, Time, TrackId, TrackListInterface, Uri, Volume
 };
 use serde_json::Value;
 use std::fs::{Permissions, create_dir, set_permissions};
@@ -83,7 +80,19 @@ impl SocketHandler {
                         if let Ok(json) = serde_json::from_str::<Value>(&line) {
                             match json.get("event").and_then(|e| e.as_str()) {
                                 Some("trackchange") => {
-                                    let _ = self.command_sender.send(SocketCommand::TrackChange(Metadata::default())).await;
+                                    if let Some(metadata_json) = json.get("metadata") {
+                                        let trackid_str = metadata_json.get("trackid").and_then(|t| t.as_str()).unwrap_or("/org/musicbee/track/unknown");
+                                        let title = metadata_json.get("title").and_then(|t| t.as_str()).unwrap_or("Unknown Title");
+                                        let artist = metadata_json.get("artist").and_then(|a| a.as_str()).unwrap_or("Unknown Artist");
+
+                                        let metadata = Metadata::builder()
+                                            .trackid(TrackId::try_from(trackid_str).unwrap_or_else(|_| TrackId::default()))
+                                            .title(title)
+                                            .artist(vec![artist.to_string()])
+                                            .build();
+
+                                        let _ = self.command_sender.send(SocketCommand::TrackChange(metadata)).await;
+                                    }
                                 }
                                 Some("seek") => {
                                     if let Some(duration) = json.get("duration").and_then(|d| d.as_i64()) {
@@ -420,7 +429,7 @@ async fn main() -> IoResult<()> {
     };
     let state_clone = Arc::clone(&player.state);
 
-    let _server = Server::new("MusicBee", player).await.unwrap();
+    let server = Server::new("MusicBee", player).await.unwrap();
 
     let handler = SocketHandler::new(socket_to_mpris_tx.clone(), mpris_to_socket_rx);
     task::spawn(async move {
@@ -430,24 +439,46 @@ async fn main() -> IoResult<()> {
     task::spawn(async move {
         while let Ok(cmd) = socket_to_mpris_rx.recv().await {
             match cmd {
-                SocketCommand::TrackChange(track) => {
-                    eprintln!("Track change requested: {}", track.title().unwrap());
-                }
-                SocketCommand::Seek(time) => todo!(),
+                SocketCommand::TrackChange(metadata) => {
+                    let mut state_w = state_clone.write().await;
+                    state_w.metadata = metadata.clone();
+                    server.properties_changed([
+                        Property::Metadata(metadata)
+                    ]).await.unwrap();
+                },
+                SocketCommand::Seek(time) => {
+                    let mut state_w = state_clone.write().await;
+                    state_w.position = time;
+                    server
+                        .emit(Signal::Seeked {
+                            position: time,
+                        })
+                        .await.unwrap();
+                },
                 SocketCommand::PlayPause => {
-                    let state_lock = &state_clone;
-
-                    let status = {
-                        let state = state_lock.read().await;
-                        state.playback_status.clone()
+                    let pl_status = {
+                        let state_r = state_clone.read().await;
+                        state_r.playback_status.clone()
                     };
 
-                    let mut state = state_lock.write().await;
-                    state.playback_status = match status {
-                        PlaybackStatus::Paused | PlaybackStatus::Stopped => PlaybackStatus::Playing,
-                        PlaybackStatus::Playing => PlaybackStatus::Paused,
+                    let mut state_w = state_clone.write().await;
+                     match pl_status {
+                        PlaybackStatus::Paused | PlaybackStatus::Stopped => {
+                            state_w.playback_status = PlaybackStatus::Playing;
+                            server
+                                .properties_changed([
+                                    Property::PlaybackStatus(PlaybackStatus::Playing)
+                                ]).await.unwrap();
+                        }
+                        PlaybackStatus::Playing => {
+                            state_w.playback_status = PlaybackStatus::Paused;
+                            server
+                                .properties_changed([
+                                    Property::PlaybackStatus(PlaybackStatus::Paused)
+                                ]).await.unwrap();
+                        }
                     };
-                }
+                },
             }
         }
     });
