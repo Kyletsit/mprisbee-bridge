@@ -19,7 +19,9 @@ use users::get_current_uid;
 pub enum SocketCommand {
     TrackChange(Metadata),
     Seek(Time),
+    Pause,
     PlayPause,
+    Play
 }
 
 #[derive(Debug)]
@@ -81,17 +83,29 @@ impl SocketHandler {
                             match json.get("event").and_then(|e| e.as_str()) {
                                 Some("trackchange") => {
                                     if let Some(metadata_json) = json.get("metadata") {
-                                        let trackid_str = metadata_json.get("trackid").and_then(|t| t.as_str()).unwrap_or("/org/musicbee/track/unknown");
-                                        let title = metadata_json.get("title").and_then(|t| t.as_str()).unwrap_or("Unknown Title");
+                                        let trackid_str = metadata_json.get("trackid").and_then(|a| a.as_str()).unwrap_or("/org/musicbee/track/unknown");
+                                        let title = metadata_json.get("title").and_then(|a| a.as_str()).unwrap_or("Unknown Title");
                                         let artist = metadata_json.get("artist").and_then(|a| a.as_str()).unwrap_or("Unknown Artist");
+                                        let album = metadata_json.get("album").and_then(|a| a.as_str()).unwrap_or("Unknown Album");
+
+                                        let albumart_wine_path = metadata_json.get("albumartpath").and_then(|a| a.as_str()).unwrap_or("No Album Art");
+                                        let albumart_url = "file://".to_owned() + &str::replace(
+                                                                                  &str::replace(
+                                                                                      &str::replace(albumart_wine_path, "\\", "/"),
+                                                                                      "C:/", "/home/Kyletsit/Programs/MusicBee/drive_c/"),  // TODO: USE ACTUAL WINEPREFIX PATH
+                                                                                  "Z:/", "/"
+                                                                              );
 
                                         let metadata = Metadata::builder()
                                             .trackid(TrackId::try_from(trackid_str).unwrap_or_else(|_| TrackId::default()))
                                             .title(title)
                                             .artist(vec![artist.to_string()])
+                                            .album(album)
+                                            .art_url(albumart_url)
                                             .build();
 
                                         let _ = self.command_sender.send(SocketCommand::TrackChange(metadata)).await;
+                                        let _ = self.command_sender.send(SocketCommand::Play).await;
                                     }
                                 }
                                 Some("seek") => {
@@ -173,11 +187,24 @@ impl Default for PlayerState {
             minimum_rate: 0.1,
             maximum_rate: 10.0,
             can_go_next: true,
-            can_go_previous: false,
+            can_go_previous: true,
             can_play: true,
-            can_pause: false,
+            can_pause: true,
             can_seek: true,
         }
+    }
+}
+
+impl PlayerState {
+    fn switch_playback_status(&mut self) {
+        match self.playback_status {
+            PlaybackStatus::Paused | PlaybackStatus::Stopped => {
+                self.playback_status = PlaybackStatus::Playing;
+            }
+            PlaybackStatus::Playing => {
+                self.playback_status = PlaybackStatus::Paused;
+            }
+        };
     }
 }
 
@@ -271,6 +298,7 @@ impl PlayerInterface for Player {
         if let Err(e) = self.message_sender.send(MprisMessage::Pause).await {
             eprintln!("Failed to send messge to SocketHandler: {}", e);
         }
+        self.state.read().await.playback_status;
 
         println!("Pause message sent to SocketHandler");
         Ok(())
@@ -455,29 +483,29 @@ async fn main() -> IoResult<()> {
                         })
                         .await.unwrap();
                 },
-                SocketCommand::PlayPause => {
-                    let pl_status = {
-                        let state_r = state_clone.read().await;
-                        state_r.playback_status.clone()
-                    };
-
+                SocketCommand::Pause => {
                     let mut state_w = state_clone.write().await;
-                     match pl_status {
-                        PlaybackStatus::Paused | PlaybackStatus::Stopped => {
-                            state_w.playback_status = PlaybackStatus::Playing;
-                            server
-                                .properties_changed([
-                                    Property::PlaybackStatus(PlaybackStatus::Playing)
-                                ]).await.unwrap();
-                        }
-                        PlaybackStatus::Playing => {
-                            state_w.playback_status = PlaybackStatus::Paused;
-                            server
-                                .properties_changed([
-                                    Property::PlaybackStatus(PlaybackStatus::Paused)
-                                ]).await.unwrap();
-                        }
-                    };
+                    state_w.playback_status = PlaybackStatus::Paused;
+                    server
+                        .properties_changed([
+                            Property::PlaybackStatus(PlaybackStatus::Paused)
+                        ]).await.unwrap();
+                },
+                SocketCommand::PlayPause => {
+                    let mut state_w = state_clone.write().await;
+                    state_w.switch_playback_status();
+                    server
+                        .properties_changed([
+                            Property::PlaybackStatus(state_w.playback_status)
+                        ]).await.unwrap();
+                },
+                SocketCommand::Play => {
+                    let mut state_w = state_clone.write().await;
+                    state_w.playback_status = PlaybackStatus::Playing;
+                    server
+                        .properties_changed([
+                            Property::PlaybackStatus(PlaybackStatus::Playing)
+                        ]).await.unwrap();
                 },
             }
         }
