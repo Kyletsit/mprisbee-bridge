@@ -3,7 +3,7 @@ use async_std::os::unix::net::UnixListener;
 use async_std::prelude::*;
 use async_std::sync::RwLock;
 use async_std::task;
-use futures::{FutureExt, StreamExt, select};
+use futures::{select, stream::All, FutureExt, StreamExt};
 use mpris_server::{
     builder::MetadataBuilder, zbus::{fdo, Result}, LoopStatus, Metadata, PlaybackRate, PlaybackStatus, PlayerInterface, Playlist, PlaylistId, PlaylistOrdering, PlaylistsInterface, Property, RootInterface, Server, Signal, Time, TrackId, TrackListInterface, Uri, Volume
 };
@@ -13,6 +13,7 @@ use std::io::Result as IoResult;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
+use sysinfo::System;
 use users::get_current_uid;
 
 #[derive(Debug)]
@@ -21,7 +22,8 @@ pub enum SocketCommand {
     Seek(Time),
     Pause,
     PlayPause,
-    Play
+    Play,
+    Exit,
 }
 
 #[derive(Debug)]
@@ -33,11 +35,16 @@ pub enum MprisMessage {
     Stop,
     Play,
     Seek(Time),
+    SetPosition(TrackId, Time),
+    SetLoopStatus(LoopStatus),
+    SetShuffle(bool),
+    SetVolume(Volume),
 }
 
 pub struct SocketHandler {
     command_sender: Sender<SocketCommand>,
     message_receiver: Receiver<MprisMessage>,
+    wineprefix: Option<std::string::String>,
 }
 
 impl SocketHandler {
@@ -48,10 +55,11 @@ impl SocketHandler {
         Self {
             command_sender,
             message_receiver,
+            wineprefix: None,
         }
     }
 
-    pub async fn run(&self) -> IoResult<()> {
+    pub async fn run(&mut self) -> IoResult<()> {
         let socket_dir = format!("/tmp/mprisbee{}", get_current_uid());
         create_dir(&socket_dir).unwrap_or_else(|e| {
             if e.kind() != std::io::ErrorKind::AlreadyExists {
@@ -71,6 +79,34 @@ impl SocketHandler {
         eprintln!("Socket listening at: {}", socket_path);
 
         let (stream, _) = listener.accept().await?;
+
+        let mut sys = System::new();
+        sys.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::All,
+            true,
+            sysinfo::ProcessRefreshKind::nothing().with_environ(sysinfo::UpdateKind::Always)
+        );
+
+        if let Some(process) = sys.processes_by_exact_name("MusicBee.exe".as_ref()).next() {
+            if let Some(wineprefix) = process.environ().iter()
+                .find_map(|var| {
+                    let var_str = var.to_string_lossy();
+                    if var_str.starts_with("WINEPREFIX=") {
+                        Some(var_str["WINEPREFIX=".len()..].to_string())
+                    } else {
+                        None
+                    }
+                })
+            {
+                println!("WINEPREFIX: {}", wineprefix);
+                self.wineprefix = wineprefix.into();
+            } else {
+                println!("WINEPREFIX not found in environment");
+            }
+        } else {
+            println!("No MusicBee.exe process found");
+        }
+
         let reader = async_std::io::BufReader::new(&stream);
         let mut lines = reader.lines();
         let mut writer = &stream;
@@ -85,36 +121,130 @@ impl SocketHandler {
                                     if let Some(metadata_json) = json.get("metadata") {
                                         let trackid_str = metadata_json.get("trackid").and_then(|a| a.as_str()).unwrap_or("/org/musicbee/track/unknown");
                                         let title = metadata_json.get("title").and_then(|a| a.as_str()).unwrap_or("Unknown Title");
-                                        let artist = metadata_json.get("artist").and_then(|a| a.as_str()).unwrap_or("Unknown Artist");
+                                        let length = Time::from_millis(metadata_json.get("length").and_then(|a| a.as_i64()).unwrap_or(0));
+                                        let artist: Vec<String> = metadata_json
+                                            .get("artist")
+                                            .and_then(|a| a.as_array())
+                                            .map(|arr| {
+                                                arr.iter()
+                                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                                .collect()
+                                            })
+                                            .filter(|v: &Vec<String>| !v.is_empty())
+                                            .unwrap_or_else(|| vec!["Unknown Artist".to_string()]);
                                         let album = metadata_json.get("album").and_then(|a| a.as_str()).unwrap_or("Unknown Album");
+                                        let disc_number =  metadata_json.get("disc_number").and_then(|a| a.as_i64());
+                                        let track_number = metadata_json.get("track_number").and_then(|a| a.as_i64());
+                                        let album_artist: Option<Vec<String>> = metadata_json
+                                            .get("album_artist")
+                                            .and_then(|a| a.as_array())
+                                            .map(|arr| {
+                                                arr.iter()
+                                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                                .collect()
+                                            });
+                                        let composer: Option<Vec<String>> = metadata_json
+                                            .get("composer")
+                                            .and_then(|a| a.as_array())
+                                            .map(|arr| {
+                                                arr.iter()
+                                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                                .collect()
+                                            });
+                                        let lyricist: Option<Vec<String>> = metadata_json
+                                            .get("lyricist")
+                                            .and_then(|a| a.as_array())
+                                            .map(|arr| {
+                                                arr.iter()
+                                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                                .collect()
+                                            });
+                                        let genre: Option<Vec<String>> = metadata_json
+                                            .get("genre")
+                                            .and_then(|a| a.as_array())
+                                            .map(|arr| {
+                                                arr.iter()
+                                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                                .collect()
+                                            });
+                                        let bpm = metadata_json.get("bpm").and_then(|a| a.as_i64());
+                                        let content_created = metadata_json.get("content_created").and_then(|a| a.as_str());
+                                        let rating = metadata_json.get("rating").and_then(|a| a.as_f64());
+                                        let comment: Option<Vec<String>> = metadata_json
+                                            .get("comment")
+                                            .and_then(|a| a.as_array())
+                                            .map(|arr| {
+                                                arr.iter()
+                                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                                .collect()
+                                            });
+                                        let file_url = metadata_json
+                                            .get("file_url")
+                                            .and_then(|a| a.as_str())
+                                            .map(|s| format!("file://{}", s))
+                                            .unwrap_or_else(|| "Unknown File URL".to_string());
+                                        let albumart_url = metadata_json
+                                            .get("albumartpath")
+                                            .and_then(|a| a.as_str())
+                                            .map(|path| {
+                                                "file://".to_owned()
+                                                    + &path
+                                                        .replace('\\', "/")
+                                                        .replace("C:/", &format!("{}drive_c/", self.wineprefix.clone().unwrap()) )
+                                                        .replace("Z:/", "/")
+                                            });
 
-                                        let albumart_wine_path = metadata_json.get("albumartpath").and_then(|a| a.as_str()).unwrap_or("No Album Art");
-                                        let albumart_url = "file://".to_owned() + &str::replace(
-                                                                                  &str::replace(
-                                                                                      &str::replace(albumart_wine_path, "\\", "/"),
-                                                                                      "C:/", "/home/Kyletsit/Programs/MusicBee/drive_c/"),  // TODO: USE ACTUAL WINEPREFIX PATH
-                                                                                  "Z:/", "/"
-                                                                              );
-
-                                        let metadata = Metadata::builder()
+                                         let mut builder = Metadata::builder()
                                             .trackid(TrackId::try_from(trackid_str).unwrap_or_else(|_| TrackId::default()))
                                             .title(title)
-                                            .artist(vec![artist.to_string()])
+                                            .length(length)
+                                            .artist(artist)
                                             .album(album)
-                                            .art_url(albumart_url)
-                                            .build();
+                                            .url(file_url);
+
+                                        macro_rules! set_if_some {
+                                            ($builder:expr, $method:ident, $opt:expr) => {
+                                                if let Some(val) = $opt {
+                                                    $builder = $builder.$method(val);
+                                                }
+                                            };
+                                        }
+
+                                        set_if_some!(builder, disc_number, disc_number.and_then(|x| x.try_into().ok()));
+                                        set_if_some!(builder, track_number, track_number.and_then(|x| x.try_into().ok()));
+                                        set_if_some!(builder, album_artist, album_artist);
+                                        set_if_some!(builder, composer, composer);
+                                        set_if_some!(builder, lyricist, lyricist);
+                                        set_if_some!(builder, genre, genre);
+                                        set_if_some!(builder, audio_bpm, bpm.and_then(|x| x.try_into().ok()));
+                                        set_if_some!(builder, content_created, content_created);
+                                        set_if_some!(builder, user_rating, rating);
+                                        set_if_some!(builder, comment, comment);
+                                        set_if_some!(builder, art_url, albumart_url);
+
+                                        let metadata = builder.build();
 
                                         let _ = self.command_sender.send(SocketCommand::TrackChange(metadata)).await;
                                         let _ = self.command_sender.send(SocketCommand::Play).await;
                                     }
                                 }
                                 Some("seek") => {
-                                    if let Some(duration) = json.get("duration").and_then(|d| d.as_i64()) {
-                                        let _ = self.command_sender.send(SocketCommand::Seek(Time::from_millis(duration))).await;
+                                    if let Some(offset) = json.get("offset").and_then(|d| d.as_i64()) {
+                                        let _ = self.command_sender.send(SocketCommand::Seek(Time::from_millis(offset))).await;
                                     }
+                                }
+                                Some("pause") => {
+                                    let _ = self.command_sender.send(SocketCommand::Pause).await;
                                 }
                                 Some("playpause") => {
                                     let _ = self.command_sender.send(SocketCommand::PlayPause).await;
+                                }
+                                Some("play") => {
+                                    let _ = self.command_sender.send(SocketCommand::Play).await;
+                                }
+                                Some("exit") => {
+                                    let _ = self.command_sender.send(SocketCommand::Exit).await;
+                                    break;
                                 }
                                 Some(other) => {
                                     eprintln!("Unknown event: {}", other);
@@ -137,13 +267,14 @@ impl SocketHandler {
                             MprisMessage::PlayPause => serde_json::json!({"event":"playpause"}),
                             MprisMessage::Stop => serde_json::json!({"event":"stop"}),
                             MprisMessage::Play => serde_json::json!({"event":"play"}),
-                            MprisMessage::Seek(duration) => serde_json::json!({"event":"seek", "duration":duration}),
-                        };
-                        if let Err(e) = writer.write_all(json.to_string().as_bytes()).await {
+                            MprisMessage::Seek(offset) => serde_json::json!({"event":"seek","offset":offset}),
+                            MprisMessage::SetPosition(trackid,position) => serde_json::json!({"event":"position","trackid":trackid,"position":position.as_millis()}),
+                            MprisMessage::SetLoopStatus(loop_status) => serde_json::json!({"event":"loop_status","status":loop_status.as_str()}),
+                            MprisMessage::SetShuffle(shuffle) => serde_json::json!({"event":"shuffle","bool":shuffle}),
+                            MprisMessage::SetVolume(volume) => serde_json::json!({"event":"volume","float":volume}),
+                                                    };
+                        if let Err(e) = writer.write_all(format!("{}\n", json).as_bytes()).await {
                             eprintln!("Failed to write to socket: {}", e);
-                        }
-                        if let Err(e) = writer.write_all(b"\n").await {
-                            eprintln!("Failed to write \\n to socket: {}", e);
                         }
                         if let Err(e) = writer.flush().await {
                             eprintln!("Failed to flush socket: {}", e);
@@ -153,6 +284,7 @@ impl SocketHandler {
             }
         }
 
+        println!("Broke out of the SocketHandler loop");
         Ok(())
     }
 }
@@ -160,13 +292,10 @@ impl SocketHandler {
 struct PlayerState {
     playback_status: PlaybackStatus,
     loop_status: LoopStatus,
-    playback_rate: PlaybackRate,
     shuffle: bool,
     metadata: Metadata,
     volume: Volume,
     position: Time,
-    minimum_rate: PlaybackRate,
-    maximum_rate: PlaybackRate,
     can_go_next: bool,
     can_go_previous: bool,
     can_play: bool,
@@ -179,13 +308,10 @@ impl Default for PlayerState {
         Self {
             playback_status: PlaybackStatus::Stopped,
             loop_status: LoopStatus::None,
-            playback_rate: 1.0,
             shuffle: false,
             metadata: Metadata::default(),
             volume: Volume::default(),
             position: Time::default(),
-            minimum_rate: 0.1,
-            maximum_rate: 10.0,
             can_go_next: true,
             can_go_previous: true,
             can_play: true,
@@ -225,12 +351,12 @@ impl RootInterface for Player {
     }
 
     async fn can_quit(&self) -> fdo::Result<bool> {
-        println!("CanQuit");
+        println!("CanQuit: false");
         Ok(false)
     }
 
     async fn fullscreen(&self) -> fdo::Result<bool> {
-        println!("Fullscreen");
+        println!("Fullscreen: false");
         Ok(false)
     }
 
@@ -240,37 +366,37 @@ impl RootInterface for Player {
     }
 
     async fn can_set_fullscreen(&self) -> fdo::Result<bool> {
-        println!("CanSetFullscreen");
+        println!("CanSetFullscreen: false");
         Ok(false)
     }
 
     async fn can_raise(&self) -> fdo::Result<bool> {
-        println!("CanRaise");
+        println!("CanRaise: true");
         Ok(true)
     }
 
     async fn has_track_list(&self) -> fdo::Result<bool> {
-        println!("HasTrackList");
+        println!("HasTrackList: false");
         Ok(false)
     }
 
     async fn identity(&self) -> fdo::Result<String> {
-        println!("Identity");
+        println!("Identity: MusicBee");
         Ok("MusicBee".into())
     }
 
     async fn desktop_entry(&self) -> fdo::Result<String> {
-        println!("DesktopEntry");
+        println!("DesktopEntry: MusicBee");
         Ok("MusicBee".into())
     }
 
     async fn supported_uri_schemes(&self) -> fdo::Result<Vec<String>> {
-        println!("SupportedUriSchemes");
+        println!("SupportedUriSchemes: [file]");
         Ok(vec!["file".into()])
     }
 
     async fn supported_mime_types(&self) -> fdo::Result<Vec<String>> {
-        println!("SupportedMimeTypes");
+        println!("SupportedMimeTypes: []");
         Ok(vec![])
     }
 }
@@ -367,7 +493,7 @@ impl PlayerInterface for Player {
 
     async fn rate(&self) -> fdo::Result<PlaybackRate> {
         println!("Rate");
-        Ok(self.state.read().await.playback_rate)
+        Ok(1.0)
     }
 
     async fn set_rate(&self, rate: PlaybackRate) -> Result<()> {
@@ -407,12 +533,12 @@ impl PlayerInterface for Player {
 
     async fn minimum_rate(&self) -> fdo::Result<PlaybackRate> {
         println!("MinimumRate");
-        Ok(self.state.read().await.minimum_rate)
+        Ok(1.0)
     }
 
     async fn maximum_rate(&self) -> fdo::Result<PlaybackRate> {
         println!("MaximumRate");
-        Ok(self.state.read().await.maximum_rate)
+        Ok(1.0)
     }
 
     async fn can_go_next(&self) -> fdo::Result<bool> {
@@ -441,7 +567,7 @@ impl PlayerInterface for Player {
     }
 
     async fn can_control(&self) -> fdo::Result<bool> {
-        println!("CanControl");
+        println!("CanControl: true");
         Ok(true)
     }
 }
@@ -459,7 +585,7 @@ async fn main() -> IoResult<()> {
 
     let server = Server::new("MusicBee", player).await.unwrap();
 
-    let handler = SocketHandler::new(socket_to_mpris_tx.clone(), mpris_to_socket_rx);
+    let mut handler = SocketHandler::new(socket_to_mpris_tx.clone(), mpris_to_socket_rx);
     task::spawn(async move {
         handler.run().await.unwrap();
     });
@@ -507,9 +633,14 @@ async fn main() -> IoResult<()> {
                             Property::PlaybackStatus(PlaybackStatus::Playing)
                         ]).await.unwrap();
                 },
+                SocketCommand::Exit => {
+                    break;
+                },
             }
         }
     });
+
+    println!("Broke out of the main loop");
 
     async_std::future::pending::<()>().await;
     Ok(())
