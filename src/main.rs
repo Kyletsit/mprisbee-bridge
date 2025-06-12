@@ -1,11 +1,11 @@
 use async_channel::{Receiver, Sender};
-use async_std::os::unix::net::UnixListener;
+use async_std::{fs::read, os::unix::net::UnixListener};
 use async_std::prelude::*;
 use async_std::sync::RwLock;
 use async_std::task;
 use futures::{select, stream::All, FutureExt, StreamExt};
 use mpris_server::{
-    builder::MetadataBuilder, zbus::{fdo, Result}, LoopStatus, Metadata, PlaybackRate, PlaybackStatus, PlayerInterface, Playlist, PlaylistId, PlaylistOrdering, PlaylistsInterface, Property, RootInterface, Server, Signal, Time, TrackId, TrackListInterface, Uri, Volume
+    builder::MetadataBuilder, zbus::{fdo, zvariant::Type, Message, Result}, LoopStatus, Metadata, PlaybackRate, PlaybackStatus, PlayerInterface, Playlist, PlaylistId, PlaylistOrdering, PlaylistsInterface, Property, RootInterface, Server, Signal, Time, TrackId, TrackListInterface, Uri, Volume
 };
 use serde_json::Value;
 use std::fs::{Permissions, create_dir, set_permissions};
@@ -19,6 +19,7 @@ use users::get_current_uid;
 #[derive(Debug)]
 pub enum SocketCommand {
     TrackChange(Metadata),
+    TrackUpdate(Metadata),
     Seek(Time),
     Pause,
     PlayPause,
@@ -45,6 +46,7 @@ pub struct SocketHandler {
     command_sender: Sender<SocketCommand>,
     message_receiver: Receiver<MprisMessage>,
     wineprefix: Option<std::string::String>,
+    uid: users::uid_t,
 }
 
 impl SocketHandler {
@@ -56,11 +58,12 @@ impl SocketHandler {
             command_sender,
             message_receiver,
             wineprefix: None,
+            uid: get_current_uid(),
         }
     }
 
     pub async fn run(&mut self) -> IoResult<()> {
-        let socket_dir = format!("/tmp/mprisbee{}", get_current_uid());
+        let socket_dir = format!("/tmp/mprisbee{}", self.uid);
         create_dir(&socket_dir).unwrap_or_else(|e| {
             if e.kind() != std::io::ErrorKind::AlreadyExists {
                 panic!("{}", e);
@@ -116,8 +119,130 @@ impl SocketHandler {
                 line = lines.next().fuse() => {
                     if let Some(Ok(line)) = line {
                         if let Ok(json) = serde_json::from_str::<Value>(&line) {
+                            println!("IN: Recieved {:?}", json.get("event"));
                             match json.get("event").and_then(|e| e.as_str()) {
                                 Some("trackchange") => {
+                                    println!("IN: Recieved trackchange");
+
+                                    if let Some(metadata_json) = json.get("metadata") {
+                                        let trackid_str = metadata_json.get("trackid").and_then(|a| a.as_str()).unwrap_or("/org/musicbee/track/unknown");
+                                        let title = metadata_json.get("title").and_then(|a| a.as_str()).unwrap_or("Unknown Title");
+                                        let length = Time::from_millis(metadata_json.get("length").and_then(|a| a.as_i64()).unwrap_or(0));
+                                        let artist: Vec<String> = metadata_json
+                                            .get("artist")
+                                            .and_then(|a| a.as_array())
+                                            .map(|arr| {
+                                                arr.iter()
+                                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                                .collect()
+                                            })
+                                            .filter(|v: &Vec<String>| !v.is_empty())
+                                            .unwrap_or_else(|| vec!["Unknown Artist".to_string()]);
+                                        let album = metadata_json.get("album").and_then(|a| a.as_str()).unwrap_or("Unknown Album");
+                                        let disc_number =  metadata_json.get("disc_number").and_then(|a| a.as_i64());
+                                        let track_number = metadata_json.get("track_number").and_then(|a| a.as_i64());
+                                        let album_artist: Option<Vec<String>> = metadata_json
+                                            .get("album_artist")
+                                            .and_then(|a| a.as_array())
+                                            .map(|arr| {
+                                                arr.iter()
+                                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                                .collect()
+                                            });
+                                        let composer: Option<Vec<String>> = metadata_json
+                                            .get("composer")
+                                            .and_then(|a| a.as_array())
+                                            .map(|arr| {
+                                                arr.iter()
+                                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                                .collect()
+                                            });
+                                        let lyricist: Option<Vec<String>> = metadata_json
+                                            .get("lyricist")
+                                            .and_then(|a| a.as_array())
+                                            .map(|arr| {
+                                                arr.iter()
+                                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                                .collect()
+                                            });
+                                        let genre: Option<Vec<String>> = metadata_json
+                                            .get("genre")
+                                            .and_then(|a| a.as_array())
+                                            .map(|arr| {
+                                                arr.iter()
+                                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                                .collect()
+                                            });
+                                        let bpm = metadata_json.get("bpm").and_then(|a| a.as_i64());
+                                        let content_created = metadata_json.get("content_created").and_then(|a| a.as_str());
+                                        let rating = metadata_json.get("rating").and_then(|a| a.as_f64());
+                                        let comment: Option<Vec<String>> = metadata_json
+                                            .get("comment")
+                                            .and_then(|a| a.as_array())
+                                            .map(|arr| {
+                                                arr.iter()
+                                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                                .collect()
+                                            });
+                                        let file_url = metadata_json
+                                            .get("file_url")
+                                            .and_then(|a| a.as_str())
+                                            .map(|path| {
+                                                "file://".to_owned()
+                                                    + &path
+                                                        .replace('\\', "/")
+                                                        .replace("C:/", &format!("{}drive_c/", self.wineprefix.clone().unwrap()) )
+                                                        .replace("Z:/", "/")
+                                            })
+                                            .unwrap_or_else(|| "Unknown File URL".to_string());
+                                        let albumart_url = metadata_json
+                                            .get("albumartpath")
+                                            .and_then(|a| a.as_str())
+                                            .map(|path| {
+                                                "file://".to_owned()
+                                                    + &path
+                                                        .replace('\\', "/")
+                                                        .replace("C:/", &format!("{}drive_c/", self.wineprefix.clone().unwrap()) )
+                                                        .replace("Z:/", "/")
+                                            });
+
+                                         let mut builder = Metadata::builder()
+                                            .trackid(TrackId::try_from(trackid_str).unwrap_or_else(|_| TrackId::default()))
+                                            .title(title)
+                                            .length(length)
+                                            .artist(artist)
+                                            .album(album)
+                                            .url(file_url);
+
+                                        macro_rules! set_if_some {
+                                            ($builder:expr, $method:ident, $opt:expr) => {
+                                                if let Some(val) = $opt {
+                                                    $builder = $builder.$method(val);
+                                                }
+                                            };
+                                        }
+
+                                        set_if_some!(builder, disc_number, disc_number.and_then(|x| x.try_into().ok()));
+                                        set_if_some!(builder, track_number, track_number.and_then(|x| x.try_into().ok()));
+                                        set_if_some!(builder, album_artist, album_artist);
+                                        set_if_some!(builder, composer, composer);
+                                        set_if_some!(builder, lyricist, lyricist);
+                                        set_if_some!(builder, genre, genre);
+                                        set_if_some!(builder, audio_bpm, bpm.and_then(|x| x.try_into().ok()));
+                                        set_if_some!(builder, content_created, content_created);
+                                        set_if_some!(builder, user_rating, rating);
+                                        set_if_some!(builder, comment, comment);
+                                        set_if_some!(builder, art_url, albumart_url);
+
+                                        let metadata = builder.build();
+
+                                        let _ = self.command_sender.send(SocketCommand::TrackChange(metadata)).await;
+                                        let _ = self.command_sender.send(SocketCommand::Play).await;
+                                    }
+                                }
+                                Some("trackupdate") => {
+                                    println!("IN: Recieved trackchange");
+
                                     if let Some(metadata_json) = json.get("metadata") {
                                         let trackid_str = metadata_json.get("trackid").and_then(|a| a.as_str()).unwrap_or("/org/musicbee/track/unknown");
                                         let title = metadata_json.get("title").and_then(|a| a.as_str()).unwrap_or("Unknown Title");
@@ -273,6 +398,7 @@ impl SocketHandler {
                             MprisMessage::SetShuffle(shuffle) => serde_json::json!({"event":"shuffle","bool":shuffle}),
                             MprisMessage::SetVolume(volume) => serde_json::json!({"event":"volume","float":volume}),
                                                     };
+                        println!("OUT: {}", json);
                         if let Err(e) = writer.write_all(format!("{}\n", json).as_bytes()).await {
                             eprintln!("Failed to write to socket: {}", e);
                         }
@@ -287,6 +413,27 @@ impl SocketHandler {
         println!("Broke out of the SocketHandler loop");
         Ok(())
     }
+}
+
+impl Drop for SocketHandler {
+    fn drop(&mut self) {
+            let socket_dir = format!("/tmp/mprisbee{}", self.uid);
+            let socket_path = format!("{}/wine-out", socket_dir);
+
+            println!("Removing {}", socket_path);
+            std::fs::remove_file(socket_path).unwrap_or_else(|e| {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    panic!("{}", e);
+                }
+            });
+
+            println!("Removing {}", socket_dir);
+            std::fs::remove_dir(socket_dir).unwrap_or_else(|e| {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    panic!("{}", e);
+                }
+            });
+        }
 }
 
 struct PlayerState {
@@ -585,15 +732,23 @@ async fn main() -> IoResult<()> {
 
     let server = Server::new("MusicBee", player).await.unwrap();
 
-    let mut handler = SocketHandler::new(socket_to_mpris_tx.clone(), mpris_to_socket_rx);
-    task::spawn(async move {
-        handler.run().await.unwrap();
+    let mut socket_handler = SocketHandler::new(socket_to_mpris_tx.clone(), mpris_to_socket_rx);
+    let socket_handler_handle = task::spawn(async move {
+        socket_handler.run().await.unwrap();
+        println!("SocketHandler finished, deleting socket");
     });
 
-    task::spawn(async move {
+    let command_handler_handle = task::spawn(async move {
         while let Ok(cmd) = socket_to_mpris_rx.recv().await {
             match cmd {
                 SocketCommand::TrackChange(metadata) => {
+                    let mut state_w = state_clone.write().await;
+                    state_w.metadata = metadata.clone();
+                    server.properties_changed([
+                        Property::Metadata(metadata)
+                    ]).await.unwrap();
+                },
+                SocketCommand::TrackUpdate(metadata) => {
                     let mut state_w = state_clone.write().await;
                     state_w.metadata = metadata.clone();
                     server.properties_changed([
@@ -638,10 +793,15 @@ async fn main() -> IoResult<()> {
                 },
             }
         }
+
+        println!("Broke out of the SocketCommand handler loop");
     });
 
-    println!("Broke out of the main loop");
-
-    async_std::future::pending::<()>().await;
+    println!("Main waiting for SocketCommand handler to finish...");
+    task::block_on(command_handler_handle);
+    println!("SocketCommand handler finished");
+    println!("Main waiting for SocketHandler to finish...");
+    task::block_on(socket_handler_handle);
+    println!("SocketHandler finished, Main concluding");
     Ok(())
 }
