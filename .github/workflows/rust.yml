@@ -23,7 +23,7 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Build
-      run: cargo build --verbose
+      run: cargo build --release
       
     - name: Upload compiled files
       uses: actions/upload-artifact@v4
