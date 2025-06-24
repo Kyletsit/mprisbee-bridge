@@ -1,0 +1,33 @@
+name: Rust
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_config:
+        description: 'Build Configuration'
+        required: true
+        default: 'Release'
+        type: choice
+        options:
+          - Debug
+          - Release
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build
+      run: cargo build --verbose
+      
+    - name: Upload compiled files
+      uses: actions/upload-artifact@v4
+      with:           
+        name: mprisbee-bridge
+        path: |
+          target/release/mprisbee-bridge
