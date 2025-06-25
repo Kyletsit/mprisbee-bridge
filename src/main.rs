@@ -580,7 +580,11 @@ impl PlayerInterface for Player {
     }
 
     async fn position(&self) -> fdo::Result<Time> {
-        println!("Position");
+        if let Err(e) = self.message_sender.send(MprisMessage::GetPosition).await {
+            eprintln!("Failed to send message to SocketHandler: {}", e);
+        }
+
+        println!("GetPosition message sent to SocketHandler");
         Ok(self.state.read().await.position)
     }
 
