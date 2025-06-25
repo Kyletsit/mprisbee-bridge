@@ -324,7 +324,7 @@ impl SocketHandler {
 impl Drop for SocketHandler {
     fn drop(&mut self) {
             let socket_dir = format!("/tmp/mprisbee{}", self.uid);
-            let socket_path = format!("{}/wine-out", socket_dir);
+            let socket_path = format!("{}/wine.sock", socket_dir);
 
             println!("Removing {}", socket_path);
             std::fs::remove_file(socket_path).unwrap_or_else(|e| {
