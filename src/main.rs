@@ -1,12 +1,12 @@
 use async_channel::{Receiver, Sender};
-use async_std::{fs::read, os::unix::net::UnixListener};
-use async_std::{path, prelude::*};
+use async_std::{os::unix::net::UnixListener};
+use async_std::{prelude::*};
 use async_std::sync::RwLock;
 use async_std::task;
-use futures::{select, stream::All, FutureExt, StreamExt};
+use futures::{select, FutureExt, StreamExt};
 use mpris_server::zbus::zvariant;
 use mpris_server::{
-    builder::MetadataBuilder, zbus::{fdo, zvariant::Type, Message, Result}, LoopStatus, Metadata, PlaybackRate, PlaybackStatus, PlayerInterface, Playlist, PlaylistId, PlaylistOrdering, PlaylistsInterface, Property, RootInterface, Server, Signal, Time, TrackId, TrackListInterface, Uri, Volume
+    zbus::{fdo, Result}, LoopStatus, Metadata, PlaybackRate, PlaybackStatus, PlayerInterface, Property, RootInterface, Server, Signal, Time, TrackId, Volume
 };
 use serde_json::Value;
 use std::fs::{Permissions, create_dir, set_permissions};
@@ -25,6 +25,8 @@ pub enum SocketCommand {
     Pause,
     Play,
     Stop,
+    Position(Time),
+    Volume(f64),
     Shuffle(bool),
     LoopStatus(LoopStatus),
     Exit,
@@ -40,6 +42,7 @@ pub enum MprisMessage {
     Play,
     Seek(Time),
     SetPosition(TrackId, Time),
+    GetPosition,
     SetLoopStatus(LoopStatus),
     SetShuffle(bool),
     SetVolume(Volume),
@@ -122,7 +125,7 @@ impl SocketHandler {
                 line = lines.next().fuse() => {
                     if let Some(Ok(line)) = line {
                         if let Ok(json) = serde_json::from_str::<Value>(&line) {
-                            println!("IN: Recieved {:?}", json.get("event"));
+                            println!("IN: Recieved {}", json);
                             match json.get("event").and_then(|e| e.as_str()) {
                                 Some("metachange") => {
                                     println!("IN: Metadata {:?}", json);
@@ -248,7 +251,7 @@ impl SocketHandler {
 
                                 }
                                 Some("seek") => {
-                                    if let Some(offset) = json.get("offset").and_then(|d| d.as_i64()) {
+                                    if let Some(offset) = json.get("offset").and_then(|l| l.as_i64()) {
                                         let _ = self.command_sender.send(SocketCommand::Seek(Time::from_millis(offset))).await;
                                     }
                                 }
@@ -261,8 +264,18 @@ impl SocketHandler {
                                 Some("stop") => {
                                     let _ = self.command_sender.send(SocketCommand::Stop).await;
                                 }
+                                Some("position") => {
+                                    if let Some(position) = json.get("position").and_then(|l| l.as_i64()) {
+                                        let _ = self.command_sender.send(SocketCommand::Position(Time::from_millis(position))).await;
+                                    }
+                                }
+                                Some("volume") => {
+                                    if let Some(volume) = json.get("volume").and_then(|d| d.as_f64()) {
+                                        let _ = self.command_sender.send(SocketCommand::Volume(volume)).await;
+                                    }
+                                }
                                 Some("shuffle") => {
-                                    if let Some(shuffle) = json.get("status").and_then(|b| b.as_bool()) {
+                                    if let Some(shuffle) = json.get("shuffle").and_then(|b| b.as_bool()) {
                                         let _ = self.command_sender.send(SocketCommand::Shuffle(shuffle)).await;
                                     }
                                 }
@@ -298,8 +311,9 @@ impl SocketHandler {
                             MprisMessage::PlayPause => serde_json::json!({"event":"playpause"}),
                             MprisMessage::Stop => serde_json::json!({"event":"stop"}),
                             MprisMessage::Play => serde_json::json!({"event":"play"}),
-                            MprisMessage::Seek(offset) => serde_json::json!({"event":"seek","offset":offset.as_micros()}),
-                            MprisMessage::SetPosition(trackid, position) => serde_json::json!({"event":"position","trackid":trackid,"position":position.as_micros()}),
+                            MprisMessage::Seek(offset) => serde_json::json!({"event":"seek","offset":offset.as_millis()}),
+                            MprisMessage::SetPosition(trackid, position) => serde_json::json!({"event":"position","trackid":trackid,"position":position.as_millis()}),
+                            MprisMessage::GetPosition => serde_json::json!({"event":"getposition"}),
                             MprisMessage::SetLoopStatus(loop_status) => serde_json::json!({"event":"loop_status","status":loop_status.as_str()}),
                             MprisMessage::SetShuffle(shuffle) => serde_json::json!({"event":"shuffle","shuffle":shuffle}),
                             MprisMessage::SetVolume(volume) => serde_json::json!({"event":"volume","volume":volume}),
@@ -374,19 +388,6 @@ impl Default for PlayerState {
     }
 }
 
-impl PlayerState {
-    fn switch_playback_status(&mut self) {
-        match self.playback_status {
-            PlaybackStatus::Paused | PlaybackStatus::Stopped => {
-                self.playback_status = PlaybackStatus::Playing;
-            }
-            PlaybackStatus::Playing => {
-                self.playback_status = PlaybackStatus::Paused;
-            }
-        };
-    }
-}
-
 struct Player {
     state: Arc<RwLock<PlayerState>>,
     message_sender: Sender<MprisMessage>,
@@ -399,27 +400,22 @@ impl RootInterface for Player {
     }
 
     async fn quit(&self) -> fdo::Result<()> {
-        println!("Quit");
         Ok(())
     }
 
     async fn can_quit(&self) -> fdo::Result<bool> {
-        println!("CanQuit: false");
         Ok(false)
     }
 
     async fn fullscreen(&self) -> fdo::Result<bool> {
-        println!("Fullscreen: false");
         Ok(false)
     }
 
-    async fn set_fullscreen(&self, fullscreen: bool) -> Result<()> {
-        println!("SetFullscreen({})", fullscreen);
+    async fn set_fullscreen(&self, _fullscreen: bool) -> Result<()> {
         Ok(())
     }
 
     async fn can_set_fullscreen(&self) -> fdo::Result<bool> {
-        println!("CanSetFullscreen: false");
         Ok(false)
     }
 
@@ -429,17 +425,14 @@ impl RootInterface for Player {
     }
 
     async fn has_track_list(&self) -> fdo::Result<bool> {
-        println!("HasTrackList: false");
         Ok(false)
     }
 
     async fn identity(&self) -> fdo::Result<String> {
-        println!("Identity: MusicBee");
         Ok("MusicBee".into())
     }
 
     async fn desktop_entry(&self) -> fdo::Result<String> {
-        println!("DesktopEntry: MusicBee");
         Ok("MusicBee".into())
     }
 
@@ -449,7 +442,6 @@ impl RootInterface for Player {
     }
 
     async fn supported_mime_types(&self) -> fdo::Result<Vec<String>> {
-        println!("SupportedMimeTypes: []");
         Ok(vec![])
     }
 }
@@ -457,7 +449,7 @@ impl RootInterface for Player {
 impl PlayerInterface for Player {
     async fn next(&self) -> fdo::Result<()> {
         if let Err(e) = self.message_sender.send(MprisMessage::Next).await {
-            eprintln!("Failed to send messge to SocketHandler: {}", e);
+            eprintln!("Failed to send message to SocketHandler: {}", e);
         }
 
         println!("Next message sent to SocketHandler");
@@ -466,7 +458,7 @@ impl PlayerInterface for Player {
 
     async fn previous(&self) -> fdo::Result<()> {
         if let Err(e) = self.message_sender.send(MprisMessage::Previous).await {
-            eprintln!("Failed to send messge to SocketHandler: {}", e);
+            eprintln!("Failed to send message to SocketHandler: {}", e);
         }
 
         println!("Previous message sent to SocketHandler");
@@ -475,7 +467,7 @@ impl PlayerInterface for Player {
 
     async fn pause(&self) -> fdo::Result<()> {
         if let Err(e) = self.message_sender.send(MprisMessage::Pause).await {
-            eprintln!("Failed to send messge to SocketHandler: {}", e);
+            eprintln!("Failed to send message to SocketHandler: {}", e);
         }
         self.state.read().await.playback_status;
 
@@ -485,7 +477,7 @@ impl PlayerInterface for Player {
 
     async fn play_pause(&self) -> fdo::Result<()> {
         if let Err(e) = self.message_sender.send(MprisMessage::PlayPause).await {
-            eprintln!("Failed to send messge to SocketHandler: {}", e);
+            eprintln!("Failed to send message to SocketHandler: {}", e);
         }
 
         println!("PlayPause message sent to SocketHandler");
@@ -494,7 +486,7 @@ impl PlayerInterface for Player {
 
     async fn stop(&self) -> fdo::Result<()> {
         if let Err(e) = self.message_sender.send(MprisMessage::Stop).await {
-            eprintln!("Failed to send messge to SocketHandler: {}", e);
+            eprintln!("Failed to send message to SocketHandler: {}", e);
         }
 
         println!("Stop message sent to SocketHandler");
@@ -503,7 +495,7 @@ impl PlayerInterface for Player {
 
     async fn play(&self) -> fdo::Result<()> {
         if let Err(e) = self.message_sender.send(MprisMessage::Play).await {
-            eprintln!("Failed to send messge to SocketHandler: {}", e);
+            eprintln!("Failed to send message to SocketHandler: {}", e);
         }
 
         println!("Play message sent to SocketHandler");
@@ -512,82 +504,78 @@ impl PlayerInterface for Player {
 
     async fn seek(&self, offset: Time) -> fdo::Result<()> {
         if let Err(e) = self.message_sender.send(MprisMessage::Seek(offset)).await {
-            eprintln!("Failed to send messge to SocketHandler: {}", e);
+            eprintln!("Failed to send message to SocketHandler: {}", e);
         }
 
-        println!("Seek message sent to SocketHandler");
+        println!("Seek {} message sent to SocketHandler", offset.as_micros());
         Ok(())
     }
 
     async fn set_position(&self, track_id: TrackId, position: Time) -> fdo::Result<()> {
-        println!("SetPosition({}, {:?})", track_id, position);
+        if let Err(e) = self.message_sender.send(MprisMessage::SetPosition(track_id.clone(), position)).await {
+            eprintln!("Failed to send message to SocketHandler: {}", e);
+        }
+
+        println!("SetPosition {}, {} message sent to SocketHandler", track_id, position.as_micros());
         Ok(())
     }
 
-    async fn open_uri(&self, uri: String) -> fdo::Result<()> {
-        println!("OpenUri({})", uri);
+    async fn open_uri(&self, _uri: String) -> fdo::Result<()> {
         Ok(())
     }
 
     async fn playback_status(&self) -> fdo::Result<PlaybackStatus> {
-        println!("PlaybackStatus");
         Ok(self.state.read().await.playback_status)
     }
 
     async fn loop_status(&self) -> fdo::Result<LoopStatus> {
-        println!("LoopStatus");
         Ok(self.state.read().await.loop_status)
     }
 
     async fn set_loop_status(&self, loop_status: LoopStatus) -> Result<()> {
         if let Err(e) = self.message_sender.send(MprisMessage::SetLoopStatus(loop_status)).await {
-            eprintln!("Failed to send messge to SocketHandler: {}", e);
+            eprintln!("Failed to send message to SocketHandler: {}", e);
         }
 
-        println!("SetLoopStatus({})", loop_status);
+        println!("SetLoopStatus {} message sent to SocketHandler", loop_status);
         Ok(())
     }
 
     async fn rate(&self) -> fdo::Result<PlaybackRate> {
-        println!("Rate");
         Ok(1.0)
     }
 
-    async fn set_rate(&self, rate: PlaybackRate) -> Result<()> {
-        println!("SetRate({})", rate);
+    async fn set_rate(&self, _rate: PlaybackRate) -> Result<()> {
         Ok(())
     }
 
     async fn shuffle(&self) -> fdo::Result<bool> {
-        println!("Shuffle");
         Ok(self.state.read().await.shuffle)
     }
 
     async fn set_shuffle(&self, shuffle: bool) -> Result<()> {
         if let Err(e) = self.message_sender.send(MprisMessage::SetShuffle(shuffle)).await {
-            eprintln!("Failed to send messge to SocketHandler: {}", e);
+            eprintln!("Failed to send message to SocketHandler: {}", e);
         }
 
-        println!("SetShuffle({})", shuffle);
+        println!("SetShuffle {} message sent to SocketHandler", shuffle);
         Ok(())
     }
 
     async fn metadata(&self) -> fdo::Result<Metadata> {
-        println!("Metadata");
         Ok(self.state.read().await.metadata.clone())
     }
 
     async fn volume(&self) -> fdo::Result<Volume> {
-        println!("Volume");
         Ok(self.state.read().await.volume)
     }
 
     async fn set_volume(&self, volume: Volume) -> Result<()> {
         if let Err(e) = self.message_sender.send(MprisMessage::SetVolume(volume)).await {
-            eprintln!("Failed to send messge to SocketHandler: {}", e);
+            eprintln!("Failed to send message to SocketHandler: {}", e);
         }
 
-        println!("SetVolume({})", volume);
+        println!("SetVolume {} message sent to SocketHandler", volume);
         Ok(())
     }
 
@@ -597,42 +585,34 @@ impl PlayerInterface for Player {
     }
 
     async fn minimum_rate(&self) -> fdo::Result<PlaybackRate> {
-        println!("MinimumRate");
         Ok(1.0)
     }
 
     async fn maximum_rate(&self) -> fdo::Result<PlaybackRate> {
-        println!("MaximumRate");
         Ok(1.0)
     }
 
     async fn can_go_next(&self) -> fdo::Result<bool> {
-        println!("CanGoNext");
         Ok(self.state.read().await.can_go_next)
     }
 
     async fn can_go_previous(&self) -> fdo::Result<bool> {
-        println!("CanGoPrevious");
         Ok(self.state.read().await.can_go_previous)
     }
 
     async fn can_play(&self) -> fdo::Result<bool> {
-        println!("CanPlay");
         Ok(self.state.read().await.can_play)
     }
 
     async fn can_pause(&self) -> fdo::Result<bool> {
-        println!("CanPause");
         Ok(self.state.read().await.can_pause)
     }
 
     async fn can_seek(&self) -> fdo::Result<bool> {
-        println!("CanSeek");
         Ok(self.state.read().await.can_seek)
     }
 
     async fn can_control(&self) -> fdo::Result<bool> {
-        println!("CanControl: true");
         Ok(true)
     }
 }
@@ -710,6 +690,18 @@ async fn main() -> IoResult<()> {
                     server
                         .properties_changed([
                             Property::PlaybackStatus(PlaybackStatus::Stopped)
+                        ]).await.unwrap();
+                },
+                SocketCommand::Position(position) => {
+                    let mut state_w = state_clone.write().await;
+                    state_w.position = position;
+                },
+                SocketCommand::Volume(volume) => {
+                    let mut state_w = state_clone.write().await;
+                    state_w.volume = volume;
+                    server
+                        .properties_changed([
+                            Property::Volume(volume)
                         ]).await.unwrap();
                 },
                 SocketCommand::Shuffle(shuffle) => {
