@@ -540,6 +540,10 @@ impl PlayerInterface for Player {
     }
 
     async fn set_loop_status(&self, loop_status: LoopStatus) -> Result<()> {
+        if let Err(e) = self.message_sender.send(MprisMessage::SetLoopStatus(loop_status)).await {
+            eprintln!("Failed to send messge to SocketHandler: {}", e);
+        }
+
         println!("SetLoopStatus({})", loop_status);
         Ok(())
     }
@@ -560,6 +564,10 @@ impl PlayerInterface for Player {
     }
 
     async fn set_shuffle(&self, shuffle: bool) -> Result<()> {
+        if let Err(e) = self.message_sender.send(MprisMessage::SetShuffle(shuffle)).await {
+            eprintln!("Failed to send messge to SocketHandler: {}", e);
+        }
+
         println!("SetShuffle({})", shuffle);
         Ok(())
     }
@@ -575,6 +583,10 @@ impl PlayerInterface for Player {
     }
 
     async fn set_volume(&self, volume: Volume) -> Result<()> {
+        if let Err(e) = self.message_sender.send(MprisMessage::SetVolume(volume)).await {
+            eprintln!("Failed to send messge to SocketHandler: {}", e);
+        }
+
         println!("SetVolume({})", volume);
         Ok(())
     }
