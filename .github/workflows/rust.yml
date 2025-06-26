@@ -1,16 +1,7 @@
-name: Rust
+name: Build
 
 on:
-  workflow_dispatch:
-    inputs:
-      build_config:
-        description: 'Build Configuration'
-        required: true
-        default: 'Release'
-        type: choice
-        options:
-          - Debug
-          - Release
+  workflow_dispatch
 
 env:
   CARGO_TERM_COLOR: always
