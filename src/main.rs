@@ -14,8 +14,10 @@ use std::io::Result as IoResult;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 use sysinfo::System;
 use users::get_current_uid;
+use notify_rust::{Notification, NotificationHandle};
 
 #[derive(Debug)]
 pub enum SocketCommand {
@@ -368,6 +370,8 @@ struct PlayerState {
     can_play: bool,
     can_pause: bool,
     can_seek: bool,
+    notif_handle: Option<NotificationHandle>,
+    last_notif_shown: Option<SystemTime>,
 }
 
 impl Default for PlayerState {
@@ -384,6 +388,55 @@ impl Default for PlayerState {
             can_play: true,
             can_pause: true,
             can_seek: true,
+            notif_handle: None,
+            last_notif_shown: None,
+        }
+    }
+}
+
+impl PlayerState {
+    fn send_notification(&mut self) {
+        let title = self.metadata.title().expect("Title should be present in all metadata");
+        let album = self.metadata.album().expect("Album should be present in all metadata");
+        let artist = self.metadata.artist().expect("Album artist should be present in all metadata");
+        let art_url = self.metadata.art_url();
+
+        if self.last_notif_shown
+            .map_or(true, |t| t.elapsed().expect("Should get no sys error") > Duration::from_secs(6)) {
+            self.notif_handle = Some({
+                let mut notif = Notification::new();
+                notif
+                    .appname("MusicBee")
+                    .summary(title)
+                    .body(format!("{} – {}", album, artist[0]).as_str())
+                    .timeout(Duration::from_secs(6));
+
+                if let Some(art_url) = art_url {
+                    notif
+                        .image_path(art_url.as_str());
+                }
+
+                notif
+                    .show().expect("Should be able to send notif")
+            });
+
+            self.last_notif_shown = Some(SystemTime::now());
+        } else {
+            if let Some(notif_handle) = self.notif_handle.as_mut() {
+                notif_handle
+                    .summary(title)
+                    .body(format!("{} – {}", album, artist[0]).as_str());
+
+                if let Some(art_url) = art_url {
+                    notif_handle
+                    .image_path(art_url.as_str());
+                }
+
+                notif_handle
+                    .update();
+
+                self.last_notif_shown = Some(SystemTime::now());
+            }
         }
     }
 }
@@ -647,17 +700,20 @@ async fn main() -> IoResult<()> {
                     let mut state_w = state_clone.write().await;
                     state_w.metadata = metadata.clone();
                     server.properties_changed([
-                        Property::Metadata(metadata)
+                        Property::Metadata(metadata.clone())
                     ]).await.unwrap();
                 },
                 SocketCommand::ArtUpdate(trackid, art_url) => {
                     let mut state_w = state_clone.write().await;
                     if let Some(player_trackid) = state_w.metadata.trackid() {
                         if player_trackid == trackid {
-                            state_w.metadata.set_art_url(art_url);
+                            state_w.metadata.set_art_url(art_url.clone());
                             server.properties_changed([
                                 Property::Metadata(state_w.metadata.clone())
                             ]).await.unwrap();
+
+                            state_w.send_notification();
+
                         } else {
                             println!("Recieved album art is not for the currently playing song.");
                         }
