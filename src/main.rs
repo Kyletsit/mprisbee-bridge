@@ -1,6 +1,6 @@
 use async_channel::{Receiver, Sender};
 use async_std::{os::unix::net::UnixListener};
-use async_std::{prelude::*};
+use async_std::{io, prelude::*};
 use async_std::sync::RwLock;
 use async_std::task;
 use futures::{select, FutureExt, StreamExt};
@@ -15,6 +15,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
+use std::env;
+use getopts::Options;
 use sysinfo::System;
 use users::get_current_uid;
 use notify_rust::{Notification, NotificationHandle};
@@ -674,8 +676,40 @@ impl PlayerInterface for Player {
     }
 }
 
+fn print_usage(opts: Options) {
+    let brief = format!("Usage: mprisbee-bridge [options]");
+    print!("{}", opts.usage(&brief));
+}
+
 #[async_std::main]
 async fn main() -> IoResult<()> {
+
+    let mut send_notifs = false;
+    let args: Vec<String> = env::args().collect();
+
+    let mut opts = Options::new();
+    opts.optflag("n", "notifications", "send notifications on track change");
+    opts.optflag("h", "help", "print this help menu");
+    let matches = match opts.parse(&args[1..]) {
+        Ok(m) => { m }
+        Err(_f) => {
+            println!("Wrong arguments!");
+            print_usage(opts);
+            return Ok(());
+        }
+    };
+    if matches.opt_present("n") {
+        send_notifs = true;
+    }
+    if matches.opt_present("h") {
+        print_usage(opts);
+        return Ok(());
+    }
+    if !matches.free.is_empty() {
+        print_usage(opts);
+        return Ok(());
+    }
+
     let (socket_to_mpris_tx, socket_to_mpris_rx) = async_channel::unbounded::<SocketCommand>();
     let (mpris_to_socket_tx, mpris_to_socket_rx) = async_channel::unbounded::<MprisMessage>();
 
@@ -712,7 +746,9 @@ async fn main() -> IoResult<()> {
                                 Property::Metadata(state_w.metadata.clone())
                             ]).await.unwrap();
 
-                            state_w.send_notification();
+                            if send_notifs {
+                                state_w.send_notification();
+                            }
 
                         } else {
                             println!("Recieved album art is not for the currently playing song.");
