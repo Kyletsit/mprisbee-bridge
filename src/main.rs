@@ -105,7 +105,12 @@ impl SocketHandler {
                 .find_map(|var| {
                     let var_str = var.to_string_lossy();
                     if var_str.starts_with("WINEPREFIX=") {
-                        Some(var_str["WINEPREFIX=".len()..].to_string())
+                        let mut pfx = var_str["WINEPREFIX=".len()..].to_string();
+                        let (_, last_ch) = pfx.char_indices().nth_back(0).expect("Wineprefix folder path shouldn't be of length 0");
+                        if last_ch != '/' {
+                            pfx.push('/');
+                        }
+                        Some(pfx)
                     } else {
                         None
                     }
