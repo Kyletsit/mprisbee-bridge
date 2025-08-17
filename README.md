@@ -12,3 +12,7 @@ export WINEPREFIX="$HOME/Programs/MusicBee/"
 mprisbee-bridge &
 wine "$WINEPREFIX/drive_c/Program Files/MusicBee/MusicBee.exe" &
 ```
+
+### Options:
+- -n | --notifications
+  - send notifications on track change
